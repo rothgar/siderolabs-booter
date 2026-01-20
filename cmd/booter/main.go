@@ -150,6 +150,10 @@ func init() {
 	rootCmd.Flags().StringVar(&serverOptions.TalosVersion, "talos-version", serverOptions.TalosVersion, "The Talos version to use. If it is not specified, "+
 		"the latest stable Talos version from the image factory will be detected and used.")
 
+	rootCmd.Flags().StringVar(&serverOptions.LocalAssetsPath, "local-assets-path", serverOptions.LocalAssetsPath,
+		"Path to local Talos assets directory. If specified, kernel and initramfs will be served from local disk instead of Image Factory. "+
+			"Patched iPXE binaries in {path}/tftp/ will be automatically detected and used. ")
+
 	// Omni options
 	// todo: disabled for now, we can re-enable it after https://github.com/siderolabs/omni/issues/1375 for better UX
 	// rootCmd.Flags().StringVar(&serverOptions.Omni.APIEndpoint, "omni-api-endpoint", serverOptions.Omni.APIEndpoint,

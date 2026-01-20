@@ -17,7 +17,6 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/siderolabs/booter/internal/server/constants"
 	"github.com/siderolabs/booter/internal/util"
 )
 
@@ -26,24 +25,26 @@ type Server struct {
 	logger *zap.Logger
 
 	listenAddress string
+	tftpPath      string
 }
 
 // NewServer creates a new TFTP server.
-func NewServer(listenAddress string, logger *zap.Logger) *Server {
+func NewServer(listenAddress, tftpPath string, logger *zap.Logger) *Server {
 	return &Server{
 		listenAddress: listenAddress,
+		tftpPath:      tftpPath,
 		logger:        logger,
 	}
 }
 
 // Run runs the TFTP server.
 func (s *Server) Run(ctx context.Context) error {
-	if err := os.MkdirAll(constants.TFTPPath, 0o777); err != nil {
+	if err := os.MkdirAll(s.tftpPath, 0o777); err != nil {
 		return err
 	}
 
 	readHandler := func(filename string, rf io.ReaderFrom) error {
-		return handleRead(filename, rf, s.logger)
+		return s.handleRead(filename, rf)
 	}
 
 	srv := tftp.NewServer(readHandler, nil)
@@ -104,28 +105,28 @@ func cleanPath(path string) string {
 }
 
 // handleRead is called when a client starts file download from server.
-func handleRead(filename string, rf io.ReaderFrom, logger *zap.Logger) error {
-	logger.Info("file requested", zap.String("filename", filename))
+func (s *Server) handleRead(filename string, rf io.ReaderFrom) error {
+	s.logger.Info("file requested", zap.String("filename", filename))
 
-	filename = filepath.Join(constants.TFTPPath, cleanPath(filename))
+	filename = filepath.Join(s.tftpPath, cleanPath(filename))
 
 	file, err := os.Open(filename)
 	if err != nil {
-		logger.Error("failed to open file", zap.String("filename", filename), zap.Error(err))
+		s.logger.Error("failed to open file", zap.String("filename", filename), zap.Error(err))
 
 		return err
 	}
 
-	defer util.LogClose(file, logger)
+	defer util.LogClose(file, s.logger)
 
 	n, err := rf.ReadFrom(file)
 	if err != nil {
-		logger.Error("failed to read from file", zap.String("filename", filename), zap.Error(err))
+		s.logger.Error("failed to read from file", zap.String("filename", filename), zap.Error(err))
 
 		return err
 	}
 
-	logger.Info("file sent", zap.String("filename", filename), zap.Int64("bytes", n))
+	s.logger.Info("file sent", zap.String("filename", filename), zap.Int64("bytes", n))
 
 	return nil
 }

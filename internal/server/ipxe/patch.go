@@ -101,36 +101,36 @@ func buildInitScript(endpoint string, port int) ([]byte, error) {
 // EFI iPXE binaries are uncompressed, so these are patched directly.
 // BIOS amd64 undionly.pxe is compressed, so we instead patch uncompressed version and compress it back using zbin.
 // (zbin is built with iPXE).
-func patchBinaries(ctx context.Context, initScript []byte, logger *zap.Logger) error {
+func patchBinaries(ctx context.Context, initScript []byte, ipxePath, tftpPath string, logger *zap.Logger) error {
 	for _, name := range []string{"ipxe", "snp"} {
 		if err := patchScript(
-			fmt.Sprintf(constants.IPXEPath+"/amd64/%s.efi", name),
-			fmt.Sprintf(constants.TFTPPath+"/%s.efi", name),
+			fmt.Sprintf(ipxePath+"/amd64/%s.efi", name),
+			fmt.Sprintf(tftpPath+"/%s.efi", name),
 			initScript,
 		); err != nil {
 			return fmt.Errorf("failed to patch %q: %w", name, err)
 		}
 
 		if err := patchScript(
-			fmt.Sprintf(constants.IPXEPath+"/arm64/%s.efi", name),
-			fmt.Sprintf(constants.TFTPPath+"/%s-arm64.efi", name),
+			fmt.Sprintf(ipxePath+"/arm64/%s.efi", name),
+			fmt.Sprintf(tftpPath+"/%s-arm64.efi", name),
 			initScript,
 		); err != nil {
 			return fmt.Errorf("failed to patch %q: %w", name, err)
 		}
 	}
 
-	if err := patchScript(constants.IPXEPath+"/amd64/kpxe/undionly.kpxe.bin", constants.IPXEPath+"/amd64/kpxe/undionly.kpxe.bin.patched", initScript); err != nil {
+	if err := patchScript(ipxePath+"/amd64/kpxe/undionly.kpxe.bin", ipxePath+"/amd64/kpxe/undionly.kpxe.bin.patched", initScript); err != nil {
 		return fmt.Errorf("failed to patch undionly.kpxe.bin: %w", err)
 	}
 
-	if err := compressKPXE(ctx, constants.IPXEPath+"/amd64/kpxe/undionly.kpxe.bin.patched", constants.IPXEPath+"/amd64/kpxe/undionly.kpxe.zinfo",
-		constants.TFTPPath+"/undionly.kpxe", logger); err != nil {
+	if err := compressKPXE(ctx, ipxePath+"/amd64/kpxe/undionly.kpxe.bin.patched", ipxePath+"/amd64/kpxe/undionly.kpxe.zinfo",
+		tftpPath+"/undionly.kpxe", logger); err != nil {
 		return fmt.Errorf("failed to compress undionly.kpxe: %w", err)
 	}
 
-	if err := compressKPXE(ctx, constants.IPXEPath+"/amd64/kpxe/undionly.kpxe.bin.patched", constants.IPXEPath+"/amd64/kpxe/undionly.kpxe.zinfo",
-		constants.TFTPPath+"/undionly.kpxe.0", logger); err != nil {
+	if err := compressKPXE(ctx, ipxePath+"/amd64/kpxe/undionly.kpxe.bin.patched", ipxePath+"/amd64/kpxe/undionly.kpxe.zinfo",
+		tftpPath+"/undionly.kpxe.0", logger); err != nil {
 		return fmt.Errorf("failed to compress undionly.kpxe.0: %w", err)
 	}
 
@@ -190,7 +190,17 @@ func compressKPXE(ctx context.Context, binFile, infoFile, outFile string, logger
 
 	defer util.LogClose(out, logger)
 
-	cmd := exec.CommandContext(ctx, "/bin/zbin", binFile, infoFile)
+	// Try to find zbin in PATH first, fallback to /bin/zbin for Docker compatibility
+	zbinPath, err := exec.LookPath("zbin")
+	if err != nil {
+		// Not found in PATH, try the default Docker location
+		zbinPath = "/bin/zbin"
+		if _, err := os.Stat(zbinPath); err != nil {
+			return fmt.Errorf("zbin not found in PATH or at %s: install zbin or ensure it's in your PATH", zbinPath)
+		}
+	}
+
+	cmd := exec.CommandContext(ctx, zbinPath, binFile, infoFile)
 	cmd.Stdout = out
 
 	err = cmd.Run()

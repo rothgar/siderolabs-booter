@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -47,8 +49,14 @@ type HandlerOptions struct {
 	TalosVersion        string
 	ExtraKernelArgs     string
 	SchematicID         string
+	LocalAssetsBaseURL  string
+	IPXEPath            string
+	TFTPPath            string
 	Extensions          []string
 	APIPort             int
+	LocalAssetsEnabled  bool
+	SecureBootEnabled   bool
+	SkipPatching        bool
 }
 
 // Handler represents an iPXE handler.
@@ -100,7 +108,18 @@ func (handler *Handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	logger.Debug("injected console kernel args to the iPXE request", zap.Strings("console_kernel_args", consoleKernelArgs))
 
-	body, statusCode, err := handler.bootViaFactoryIPXEScript(ctx, arch, kernelArgs)
+	var body string
+
+	var statusCode int
+
+	var err error
+
+	if handler.options.LocalAssetsEnabled {
+		body, statusCode = handler.bootViaLocalAssets(arch, kernelArgs)
+	} else {
+		body, statusCode, err = handler.bootViaFactoryIPXEScript(ctx, arch, kernelArgs)
+	}
+
 	if err != nil {
 		handler.logger.Error("failed to get iPXE script", zap.Error(err))
 
@@ -148,6 +167,27 @@ func (handler *Handler) bootViaFactoryIPXEScript(ctx context.Context, arch strin
 	return ipxeScript, http.StatusOK, nil
 }
 
+func (handler *Handler) bootViaLocalAssets(arch string, kernelArgs []string) (body string, statusCode int) {
+	baseURL := handler.options.LocalAssetsBaseURL
+	version := handler.options.TalosVersion
+	kernelArgsStr := strings.Join(kernelArgs, " ")
+
+	var ipxeScript string
+
+	if handler.options.SecureBootEnabled {
+		// For secure boot, use the UKI kernel
+		kernelURL := fmt.Sprintf("%s/%s/%s/vmlinuz-secureboot", baseURL, version, arch)
+		ipxeScript = fmt.Sprintf("#!ipxe\nkernel %s %s\nboot\n", kernelURL, kernelArgsStr)
+	} else {
+		// For standard boot, use kernel + initramfs
+		kernelURL := fmt.Sprintf("%s/%s/%s/kernel", baseURL, version, arch)
+		initramfsURL := fmt.Sprintf("%s/%s/%s/initramfs.xz", baseURL, version, arch)
+		ipxeScript = fmt.Sprintf("#!ipxe\nkernel %s %s\ninitrd %s\nboot\n", kernelURL, kernelArgsStr, initramfsURL)
+	}
+
+	return ipxeScript, http.StatusOK
+}
+
 func (handler *Handler) consoleKernelArgs(arch string) []string {
 	switch arch {
 	case archArm64:
@@ -155,6 +195,47 @@ func (handler *Handler) consoleKernelArgs(arch string) []string {
 	default:
 		return []string{"console=tty0", "console=ttyS0"}
 	}
+}
+
+// validateIPXEBinaries checks that the iPXE binaries directory exists and contains all required binaries.
+func validateIPXEBinaries(ipxePath string) error {
+	// Check if path exists and is a directory
+	info, err := os.Stat(ipxePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("iPXE binaries path does not exist: %s", ipxePath)
+		}
+
+		return fmt.Errorf("failed to check iPXE binaries path: %w", err)
+	}
+
+	if !info.IsDir() {
+		return fmt.Errorf("iPXE binaries path is not a directory: %s", ipxePath)
+	}
+
+	// List of required binaries
+	requiredBinaries := []string{
+		"amd64/ipxe.efi",
+		"amd64/snp.efi",
+		"arm64/ipxe.efi",
+		"arm64/snp.efi",
+		"amd64/kpxe/undionly.kpxe.bin",
+		"amd64/kpxe/undionly.kpxe.zinfo",
+	}
+
+	// Check each required binary exists
+	for _, binary := range requiredBinaries {
+		binaryPath := filepath.Join(ipxePath, binary)
+		if _, err := os.Stat(binaryPath); err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("required iPXE binary not found: %s", binaryPath)
+			}
+
+			return fmt.Errorf("failed to check iPXE binary %s: %w", binaryPath, err)
+		}
+	}
+
+	return nil
 }
 
 // NewHandler creates a new iPXE server.
@@ -174,18 +255,38 @@ func NewHandler(ctx context.Context, configServerEnabled bool, imageFactoryClien
 		}
 	}
 
-	initScript, err := buildInitScript(options.APIAdvertiseAddress, options.APIPort)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build init script: %w", err)
+	var initScript []byte
+
+	var err error
+
+	if options.SkipPatching {
+		logger.Info("using pre-patched iPXE binaries, skipping validation and patching",
+			zap.String("tftp_path", options.TFTPPath))
+
+		// Still need to build init script for the handler to serve
+		initScript, err = buildInitScript(options.APIAdvertiseAddress, options.APIPort)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build init script: %w", err)
+		}
+	} else {
+		// Validate iPXE binaries exist
+		if err := validateIPXEBinaries(options.IPXEPath); err != nil {
+			return nil, fmt.Errorf("failed to validate iPXE binaries: %w", err)
+		}
+
+		initScript, err = buildInitScript(options.APIAdvertiseAddress, options.APIPort)
+		if err != nil {
+			return nil, fmt.Errorf("failed to build init script: %w", err)
+		}
+
+		logger.Info("patch iPXE binaries", zap.String("ipxe_path", options.IPXEPath), zap.String("tftp_path", options.TFTPPath))
+
+		if err = patchBinaries(ctx, initScript, options.IPXEPath, options.TFTPPath, logger); err != nil {
+			return nil, err
+		}
+
+		logger.Info("successfully patched iPXE binaries")
 	}
-
-	logger.Info("patch iPXE binaries")
-
-	if err = patchBinaries(ctx, initScript, logger); err != nil {
-		return nil, err
-	}
-
-	logger.Info("successfully patched iPXE binaries")
 
 	kernelArgs := strings.Fields(options.ExtraKernelArgs)
 

@@ -8,12 +8,17 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
 
 	"github.com/jackpal/gateway"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/siderolabs/booter/internal/server/assets"
 	"github.com/siderolabs/booter/internal/server/config"
 	"github.com/siderolabs/booter/internal/server/dhcp"
 	"github.com/siderolabs/booter/internal/server/imagefactory"
@@ -60,6 +65,47 @@ func (s *Server) Run(ctx context.Context) error {
 		s.options.DHCPProxyIfaceOrIP = s.options.APIAdvertiseAddress
 	}
 
+	// Validate local assets configuration
+	localAssetsEnabled := s.options.LocalAssetsPath != ""
+	if localAssetsEnabled {
+		// Validate incompatible flags
+		if len(s.options.Extensions) > 0 {
+			return fmt.Errorf("--local-assets-path cannot be used with --extensions (schematics only apply to Image Factory)")
+		}
+
+		if s.options.SchematicID != "" {
+			return fmt.Errorf("--local-assets-path cannot be used with --schematic-id (schematics only apply to Image Factory)")
+		}
+
+		s.logger.Info("local assets mode enabled", zap.String("path", s.options.LocalAssetsPath))
+	}
+
+	// Resolve iPXE and TFTP paths
+	const defaultIPXEPath = "/var/lib/ipxe"
+	const defaultTFTPPath = "/var/lib/tftp"
+
+	ipxePath := defaultIPXEPath
+	tftpPath := defaultTFTPPath
+	skipIPXEPatching := false
+
+	// Check if local assets path has pre-patched iPXE binaries
+	if localAssetsEnabled {
+		prePatchedTFTPPath := filepath.Join(s.options.LocalAssetsPath, "tftp")
+		if s.hasPatchedIPXEBinaries(prePatchedTFTPPath) {
+			ipxePath = prePatchedTFTPPath
+			tftpPath = prePatchedTFTPPath
+			skipIPXEPatching = true
+			s.logger.Info("using pre-patched iPXE binaries from local assets",
+				zap.String("path", prePatchedTFTPPath))
+		}
+	}
+
+	if !skipIPXEPatching {
+		s.logger.Info("using iPXE and TFTP paths",
+			zap.String("ipxe_path", ipxePath),
+			zap.String("tftp_path", tftpPath))
+	}
+
 	configServerEnabled := s.options.Omni.APIEndpoint != ""
 
 	s.logger.Info("starting server",
@@ -93,12 +139,31 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	if s.options.TalosVersion == "" {
+		if localAssetsEnabled {
+			return fmt.Errorf("--talos-version is required when using --local-assets-path")
+		}
+
 		if s.options.TalosVersion, err = imageFactoryClient.GetLatestStableVersion(ctx); err != nil {
 			return fmt.Errorf("failed to get the latest stable Talos version from the image factory: %w", err)
 		}
 
 		s.logger.Info("Talos version is not explicitly defined, the latest stable Talos version from the image factory will be used",
 			zap.String("version", s.options.TalosVersion))
+	}
+
+	// Create assets handler if local assets are enabled
+	var assetsHandler http.Handler
+
+	var localAssetsBaseURL string
+
+	if localAssetsEnabled {
+		assetsHandler, err = assets.NewHandler(s.options.LocalAssetsPath, s.options.TalosVersion, s.options.SecureBootEnabled,
+			s.logger.With(zap.String("component", "assets_handler")))
+		if err != nil {
+			return fmt.Errorf("failed to create assets handler: %w", err)
+		}
+
+		localAssetsBaseURL = "http://" + net.JoinHostPort(s.options.APIAdvertiseAddress, strconv.Itoa(s.options.APIPort)) + "/assets"
 	}
 
 	ipxeHandler, err := ipxe.NewHandler(ctx, configServerEnabled, imageFactoryClient, ipxe.HandlerOptions{
@@ -108,13 +173,19 @@ func (s *Server) Run(ctx context.Context) error {
 		ExtraKernelArgs:     s.options.ExtraKernelArgs,
 		TalosVersion:        s.options.TalosVersion,
 		SchematicID:         s.options.SchematicID,
+		LocalAssetsEnabled:  localAssetsEnabled,
+		LocalAssetsBaseURL:  localAssetsBaseURL,
+		SecureBootEnabled:   s.options.SecureBootEnabled,
+		IPXEPath:            ipxePath,
+		TFTPPath:            tftpPath,
+		SkipPatching:        skipIPXEPatching,
 	}, s.logger.With(zap.String("component", "ipxe_handler")))
 	if err != nil {
 		return fmt.Errorf("failed to create iPXE handler: %w", err)
 	}
 
-	tftpServer := tftp.NewServer(s.options.APIListenAddress, s.logger.With(zap.String("component", "tftp_server")))
-	srvr := server.New(ctx, s.options.APIListenAddress, s.options.APIPort, configHandler, ipxeHandler, s.logger.With(zap.String("component", "server")))
+	tftpServer := tftp.NewServer(s.options.APIListenAddress, tftpPath, s.logger.With(zap.String("component", "tftp_server")))
+	srvr := server.New(ctx, s.options.APIListenAddress, s.options.APIPort, configHandler, ipxeHandler, assetsHandler, ipxePath, s.logger.With(zap.String("component", "server")))
 
 	components := []component{
 		{srvr.Run, "server"},
@@ -189,4 +260,30 @@ func (s *Server) determineAPIAdvertiseAddress() (string, error) {
 		zap.String("address", defaultSourceIP.String()))
 
 	return ip, nil
+}
+
+// hasPatchedIPXEBinaries checks if the given directory contains pre-patched iPXE binaries.
+// It checks for the presence of key patched binaries that would be created during the patching process.
+func (s *Server) hasPatchedIPXEBinaries(tftpPath string) bool {
+	// Check if directory exists
+	info, err := os.Stat(tftpPath)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+
+	// Check for key patched binaries
+	requiredFiles := []string{
+		"ipxe.efi",
+		"snp.efi",
+		"undionly.kpxe",
+	}
+
+	for _, file := range requiredFiles {
+		filePath := filepath.Join(tftpPath, file)
+		if _, err := os.Stat(filePath); err != nil {
+			return false
+		}
+	}
+
+	return true
 }

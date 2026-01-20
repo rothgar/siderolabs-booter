@@ -16,6 +16,7 @@ type Options struct {
 	TalosVersion           string
 	ExtraKernelArgs        string
 	SchematicID            string
+	LocalAssetsPath        string
 	Extensions             []string
 	Omni                   omni.Options
 	APIPort                int
